@@ -40,7 +40,9 @@ def upgrade() -> None:
             end_time timestamptz,
             fake_ip varchar,
             map varchar,
-            query_by_fake_ip_data jsonb,
+            steam_api_data jsonb,
+            ingested boolean,
+            demo bytea,
             created_at timestamptz,
             updated_at timestamptz
         );

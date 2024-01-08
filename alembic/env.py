@@ -7,7 +7,7 @@ from alembic import context
 
 import os
 
-from api import config as api_config
+from api.lib import _make_db_uri
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -31,7 +31,7 @@ target_metadata = None
 
 user = os.environ["PG_USER"]
 password = os.environ["PG_PASS"]
-config.set_main_option("sqlalchemy.url", api_config.demos_db_url)
+config.set_main_option("sqlalchemy.url", _make_db_uri())
 
 
 def run_migrations_offline() -> None:

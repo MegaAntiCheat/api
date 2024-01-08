@@ -7,26 +7,30 @@ from uuid import uuid4
 
 import requests
 import sqlalchemy as sa
-from litestar import Litestar, MediaType, Request, get, websocket, websocket_listener
+from api.lib import (
+    _check_is_active,
+    _check_key_exists,
+    _close_session,
+    _close_session_with_demo,
+    _make_db_uri,
+    _start_session,
+    check_steam_id_has_api_key,
+    generate_uuid4_int,
+    provision_api_key,
+)
+from litestar import Litestar, MediaType, Request, WebSocket, get, post, websocket_listener
 from litestar.connection import ASGIConnection
 from litestar.datastructures import State
 from litestar.di import Provide
 from litestar.exceptions import NotAuthorizedException
+from litestar.handlers import WebsocketListener
 from litestar.handlers.base import BaseRouteHandler
 from litestar.response import Redirect
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-
-def _make_db_uri(async_url: bool = False) -> str:
-    """Correctly make the database URi."""
-    user = os.environ["PG_USER"]
-    password = os.environ["PG_PASS"]
-    prefix = "postgresql"
-    if async_url:
-        prefix = f"{prefix}+asyncpg"
-
-    return f"{prefix}://{user}:{password}@localhost:5432/demos"
+DEMOS_PATH = os.path.expanduser(os.path.join("~/media", "demos"))
+os.makedirs(DEMOS_PATH, exist_ok=True)
 
 
 def get_db_connection(app: Litestar) -> Engine:
@@ -66,70 +70,42 @@ async def valid_key_guard(connection: ASGIConnection, _: BaseRouteHandler) -> No
     api_key = connection.query_params["api_key"]
 
     async_engine = connection.app.state.async_engine
-    async with async_engine.connect() as conn:
-        result = await conn.execute(sa.text("SELECT * FROM api_keys WHERE api_key = :api_key"), {"api_key": api_key})
-        data = result.all()
-        if not data:
-            raise NotAuthorizedException()
+    exists = await _check_key_exists(async_engine, api_key)
+    if not exists:
+        raise NotAuthorizedException()
 
 
-class DemoSessionManager:
-    """Helper class to manage incoming data streams."""
+async def user_in_session_guard(connection: ASGIConnection, _: BaseRouteHandler) -> None:
+    """Assert that the user is not currently in a session."""
+    async_engine = connection.app.state.async_engine
 
-    DEMOS_PATH = os.path.expanduser(os.path.join("~/media", "demos"))
-    SENTINEL = -1
+    api_key = connection.query_params["api_key"]
+    is_active = await _check_is_active(async_engine, api_key)
 
-    def __init__(self) -> None:
-        self.file_handles: dict[str, BinaryIO] = {}
-        os.makedirs(self.DEMOS_PATH, exist_ok=True)
-
-    def make_or_get_file_handle(self, session_id: int) -> BinaryIO:
-        """Take in a session ID and create or return a file handle.
-
-        Args:
-            session_id: Session ID.
-
-        Returns:
-            File handle for the session_id
-        """
-        if session_id not in self.file_handles:
-            write_path = os.path.join(self.DEMOS_PATH, f"{session_id}.dem")
-            self.file_handles[session_id] = open(write_path, "wb")
-
-        return self.file_handles[session_id]
-
-    def handle_demo_data(self, data: dict[str, str | bytes | int]) -> None:
-        """Handle incoming data from a client upload.
-
-        Args:
-            data: dict of {session_id: ..., data: bytes or self.SENTINEL}
-        """
-        session_id = data["session_id"]
-
-        file_handle = self.make_or_get_file_handle(session_id)
-
-        _data = base64.b64decode(data["data"])
-
-        if _data == self.SENTINEL:
-            file_handle.close()
-        else:
-            file_handle.write(_data)
-            file_handle.flush()
-
-        def close(self, session_id: int) -> None:
-            self.file_handles[session_id].close()
+    if is_active:
+        raise NotAuthorizedException(
+            detail="User already in a session, either remember your session token or close it out at `/close_session`!"
+        )
 
 
-demo_manager = DemoSessionManager()
+async def user_not_in_session_guard(connection: ASGIConnection, _: BaseRouteHandler) -> None:
+    """Assert that the user is not currently in a session."""
+    async_engine = connection.app.state.async_engine
+
+    api_key = connection.query_params["api_key"]
+    session_id = connection.query_params["session_id"]
+    is_active = await _check_is_active(async_engine, api_key, session_id)
+    if not is_active:
+        raise NotAuthorizedException(detail="User is not in a session, create one at `/session_id`!")
 
 
-def generate_uuid4_int() -> int:
-    """Seems useless, but makes testing easier."""
-    return uuid4().int
-
-
-@get("/session_id", guards=[valid_key_guard], sync_to_thread=False)
-def session_id(api_key: str) -> dict[str, int]:
+@get("/session_id", guards=[valid_key_guard, user_in_session_guard], sync_to_thread=False)
+def session_id(
+    request: Request,
+    api_key: str,
+    fake_ip: str,
+    map: str,
+) -> dict[str, str]:
     """Return a session ID, as well as persist to database.
 
     This is to help us know what is happening downstream:
@@ -140,49 +116,60 @@ def session_id(api_key: str) -> dict[str, int]:
     Returns:
         {"session_id": some integer}
     """
-    session_id = generate_uuid4_int()
-    return {"session_id": session_id}
+
+    _session_id = generate_uuid4_int()
+    engine = request.app.state.engine
+
+    _start_session(engine, api_key, session_id, fake_ip, map)
+
+    return {"session_id": _session_id}
 
 
-@get("/session_id_active", guards=[valid_key_guard], sync_to_thread=False)
-def session_id_active(api_key: str, session_id: int) -> dict[str, bool]:
-    """Tell if a session ID is active by querying the database.
-
-    Returns:
-        {"is_active": True or False}
-    """
-    is_active = ...
-
-    return {"is_active": is_active}
-
-
-@get("/close_session", guards=[valid_key_guard], sync_to_thread=False)
-def close_session(api_key: str, session_id: int) -> dict[str, bool]:
+@get("/close_session", guards=[valid_key_guard, user_not_in_session_guard], sync_to_thread=False)
+def close_session(request: Request, api_key: str, session_id: str) -> dict[str, bool]:
     """Close a session out.
 
     Returns:
         {"closed_successfully": True or False}
     """
-    try:
-        demo_manager.close(session_id)
-    except Exception:
-        ...
+    engine = request.app.state.engine
+    current_time = datetime.now().astimezone(timezone.utc)
+    _close_session(engine, api_key, session_id, current_time)
 
-    return {"closed_successfully": ...}
+    return {"closed_successfully": True}
 
 
-@websocket_listener("/demos")
-async def demo_session(data: dict[str, str | bytes | int]) -> dict[str, str]:
-    """Handle incoming data from a client upload.
+class DemoHandler(WebsocketListener):
+    path = "/demos"
+    receive_mode = "binary"
 
-    Smart enough to know where to write data to based on the session ID
-    as to handle reconnecting/duplicates.
+    async def on_accept(self, socket: WebSocket, api_key: str, session_id: str) -> None:
+        engine = socket.app.state.async_engine
+        exists = await _check_key_exists(engine, api_key)
+        if not exists:
+            await socket.close()
 
-    Might want to implement something like
-    https://docs.litestar.dev/2/usage/websockets.html#class-based-websocket-handling
-    because it looks cleaner and likely can handle auth/accepting/valid session id better
-    """
-    demo_manager.handle_demo_data(data)
+        active = await _check_is_active(engine, api_key, session_id)
+        if not active:
+            await socket.close()
+
+        self.api_key = api_key
+        self.session_id = session_id
+        self.path = os.path.join(DEMOS_PATH, f"{session_id}.dem")
+        self.handle = open(os.path.join(DEMOS_PATH, f"{session_id}.dem"), "wb")
+
+    def on_disconnect(self, socket: WebSocket) -> None:
+        self.handle.close()
+
+        demo = open(self.path, "rb").read()
+
+        engine = socket.app.state.engine
+        current_time = datetime.now().astimezone(timezone.utc)
+
+        _close_session_with_demo(engine, self.api_key, self.session_id, current_time, demo)
+
+    def on_receive(self, data: bytes) -> None:
+        self.handle.write(data)
 
 
 @get("/provision", sync_to_thread=False)
@@ -215,7 +202,7 @@ def provision(request: Request) -> Redirect:
     )
 
 
-@get("/provision_handler", media_type=MediaType.HTML)
+@get("/provision_handler", media_type=MediaType.HTML, sync_to_thread=True)
 def provision_handler(request: Request) -> str:
     """Handle a response from Steam.
 
@@ -258,27 +245,16 @@ def provision_handler(request: Request) -> str:
         # if it is not in the DB or say that it already exists, and if they forgot it to let an admin know...
         # admin will then delete the steam ID of the user in the DB and a new sign in will work.
         steam_id = os.path.split(data["openid.claimed_id"])[-1]
+        engine = app.state.engine
+        has_key = check_steam_id_has_api_key(engine, steam_id)
 
-        with request.app.state.engine.connect() as conn:
-            result = conn.execute(
-                sa.text("SELECT * FROM api_keys WHERE steam_id = :steam_id"), {"steam_id": steam_id}
-            ).one_or_none()
+        if not has_key:
+            api_key = uuid4().int
+            provision_api_key(engine, steam_id, api_key)
+            text = f"Successfully authenticated! Your API key is {api_key}! Do not lose this as the client needs it!"
 
-            if result is None:
-                api_key = uuid4().int
-                created_at = datetime.now().astimezone(timezone.utc).isoformat()
-                updated_at = created_at
-                conn.execute(
-                    sa.text(
-                        "INSERT INTO api_keys (steam_id, api_key, created_at, updated_at) VALUES (:steam_id, :api_key, :created_at, :updated_at);"  # noqa
-                    ),
-                    {"steam_id": steam_id, "api_key": api_key, "created_at": created_at, "updated_at": updated_at},
-                )
-                conn.commit()  # commit changes...
-                text = f"You have successfully been authenticated! Your API key is {api_key}! Do not lose this as the client needs it!"  # noqa
-
-            else:
-                text = f"Your steam id of {steam_id} already exists in our DB! If you forgot your API key, please let an admin know."  # noqa
+        else:
+            text = f"Steam ID {steam_id} already exists! If you forgot your API key, please let an admin know."
 
     return f"""
         <html>
@@ -293,6 +269,6 @@ def provision_handler(request: Request) -> str:
 
 app = Litestar(
     on_startup=[get_db_connection, get_async_db_connection],
-    route_handlers=[session_id, session_id_active, close_session, demo_session, provision, provision_handler],
+    route_handlers=[session_id, close_session, DemoHandler, provision, provision_handler],
     on_shutdown=[close_db_connection, close_async_db_connection],
 )

@@ -33,29 +33,3 @@ def test_guard(client, session_id) -> None:
     with client as test_client:
         response = test_client.get("/session_id", params={"api_key": "foo"}).json()
         assert response == {"status_code": 401, "detail": "Unauthorized"}
-
-
-@mock.patch("api.app.DemoSessionManager.make_or_get_file_handle")
-def test_demo_streaming(mock_handle, client, demo_file_path, session_id, tmp_path) -> None:
-    """Test that a demo is completely received by the API and sunk to a file."""
-    write_path = f"{tmp_path}.dem"
-    with client as test_client:
-        mock_handle.return_value = open(write_path, "wb")
-        ws_endpoint = test_client.websocket_connect("/demos")
-        with ws_endpoint as ws:
-            with open(demo_file_path, "rb") as f:
-                while True:
-                    chunk = f.read(DEMO_CHUNKSIZE_BYTES)
-                    if not chunk:
-                        data = {"session_id": session_id, "data": -1}
-                        ws.send_json(data)
-                        break
-
-                    encoded_chunk = base64.b64encode(chunk).decode("utf-8")
-                    data = {"session_id": session_id, "data": encoded_chunk}
-                    ws.send_json(data)
-
-    time.sleep(3)  # wait for buffer to finish sinking
-    with open(write_path, "rb") as actual:
-        with open(demo_file_path, "rb") as expected:
-            assert actual.read() == expected.read()
