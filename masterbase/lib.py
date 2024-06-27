@@ -57,7 +57,7 @@ def make_minio_client(is_secure: bool = False) -> Minio:
     return Minio(f"{host}:{port}", access_key=access_key, secret_key=secret_key, secure=is_secure)
 
 
-def db_export_chunks(engine: Engine, table: str) -> Generator[bytes, None, None]:
+def db_export_chunks(engine: Engine, table: str, since: datetime | None = None) -> Generator[bytes, None, None]:
     """Export the given table as an iterable of csv chunks."""
 
     class Shunt:
@@ -73,7 +73,17 @@ def db_export_chunks(engine: Engine, table: str) -> Generator[bytes, None, None]
         try:
             with engine.connect() as txn:
                 cursor = txn.connection.dbapi_connection.cursor()
-                cursor.copy_expert(f"COPY {table} TO STDOUT DELIMITER ',' CSV HEADER", shunt)
+                if since:
+                    # make a best-effort attempt to match the postgres timestamp format
+                    # this only works up to hourly precision
+                    tzoffset = int(since.utcoffset().total_seconds() / 3600)
+                    sign = "+" if tzoffset >= 0 else "-"
+                    stamp = since.strftime("%Y-%m-%d %H:%M:%S")
+                    stamp += f"{sign}{tzoffset}"
+                    query = f"(SELECT * FROM {table} WHERE created_at >= '{stamp}')"
+                else:
+                    query = table
+                cursor.copy_expert(f"COPY {query} TO STDOUT DELIMITER ',' CSV HEADER", shunt)
                 queue.put(b"")
         except Exception as err:
             queue.put(err)

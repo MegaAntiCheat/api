@@ -2,7 +2,9 @@
 
 import csv
 import io
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 import pytest
@@ -55,9 +57,9 @@ def test_client(steam_id: str, api_key: str) -> Iterator[TestClient[Litestar]]:
             conn.execute(sa.text(sql))
             sql = "TRUNCATE TABLE demo_sessions CASCADE;"
             conn.execute(sa.text(sql))
-            sql = "DELETE FROM api_keys WHERE api_key = :api_key;"
+            sql = "TRUNCATE TABLE api_keys CASCADE;"
             conn.execute(sa.text(sql), {"api_key": api_key})
-            sql = "DELETE FROM analyst_steam_ids WHERE steam_id = :steam_id;"
+            sql = "TRUNCATE TABLE analyst_steam_ids CASCADE;"
             conn.execute(sa.text(sql), {"steam_id": steam_id})
             conn.commit()
 
@@ -148,6 +150,14 @@ def test_demo_streaming_no_late(test_client: TestClient[Litestar], api_key: str)
 
 def test_db_exports(test_client: TestClient[Litestar], api_key: str) -> None:
     """Test on-demand exports from the database."""
+
+    def _parse_reports(body):
+        records = csv.DictReader(io.TextIOWrapper(io.BytesIO(body), encoding="utf8"))
+        fields = records.fieldnames
+        assert fields is not None
+        assert set(fields) == {"session_id", "target_steam_id", "reason", "created_at"}
+        return tuple(sorted(records, key=lambda r: r["created_at"]))
+
     session_id = str(_open_mock_session(test_client, api_key).json()["session_id"])
     # Insert mock reports
     expected = []
@@ -155,22 +165,24 @@ def test_db_exports(test_client: TestClient[Litestar], api_key: str) -> None:
         reason = "cheater" if i % 2 == 0 else "bot"
         target_steam_id = f"{i:020d}"
         record = {"session_id": session_id, "target_steam_id": target_steam_id, "reason": reason}
+        if i == 4:
+            time.sleep(1.0)  # postgres timestamp comparisons are second-precison
         add_report(test_client.app.state.engine, **record)
-        expected.append((session_id, target_steam_id, reason))
+        expected.append(record)
 
     test_client.get("/close_session", params={"api_key": api_key})
     response = test_client.get("/db_export", params={"api_key": api_key, "table": "reports"})
-    response_records = csv.DictReader(io.TextIOWrapper(io.BytesIO(response.content)))
-    assert response_records.fieldnames is not None and set(response_records.fieldnames).issuperset(
-        {"session_id", "target_steam_id", "reason"}
+    returned_full = _parse_reports(response.content)
+    assert tuple(expected) == tuple({k: v for k, v in r.items() if k != "created_at"} for r in returned_full)
+    since = returned_full[4]["created_at"]
+
+    tzone = timezone(timedelta(hours=int(since[-3:])))
+    stamp = datetime.strptime(since[:-3], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=tzone)
+    response = test_client.get(
+        "/db_export", params={"api_key": api_key, "table": "reports", "since": stamp.isoformat()}
     )
-    returned = sorted(
-        (
-            (record["session_id"], record["target_steam_id"], record["reason"])
-            for record in sorted(response_records, key=lambda record: record["created_at"])
-        )
-    )
-    assert tuple(expected) == tuple(returned)
+    returned_since = _parse_reports(response.content)
+    assert returned_full[4:] == returned_since
 
 
 def test_upsert_report_reason(test_client: TestClient[Litestar], api_key: str) -> None:
