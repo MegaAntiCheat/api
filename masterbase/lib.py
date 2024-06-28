@@ -698,12 +698,16 @@ def add_report(engine: Engine, session_id: str, target_steam_id: str, reason: st
         created_at = datetime.now().astimezone(timezone.utc).isoformat()
         txn.execute(
             sa.text(
-                """INSERT INTO reports (
-                    session_id, target_steam_id, created_at, reason
+                """
+                INSERT INTO reports (
+                    session_id, target_steam_id, created_at, updated_at, reason
                 ) VALUES (
-                    :session_id, :target_steam_id, :created_at, :reason)
+                    :session_id, :target_steam_id, :created_at, :created_at, :reason
+                )
                 ON CONFLICT (session_id, target_steam_id)
-                DO UPDATE SET reason = EXCLUDED.reason, created_at = NOW();
+                DO UPDATE SET
+                    reason = EXCLUDED.reason,
+                    updated_at = EXCLUDED.created_at;
                 """
             ),
             {"target_steam_id": target_steam_id, "session_id": session_id, "created_at": created_at, "reason": reason},
